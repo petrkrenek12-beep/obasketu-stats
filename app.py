@@ -1,11 +1,12 @@
 """
-NBA Player Stats - žurnalistický generátor (verze 4, ESPN API)
-Postaveno na základě reálné struktury ESPN overview odpovědi.
+NBA Player Stats - žurnalistický generátor (verze 5, FINAL)
+Postaveno na základě ověřené struktury ESPN overview JSON.
 """
 
 from flask import Flask, render_template, jsonify, request
 import requests
 import os
+import re
 
 app = Flask(__name__)
 
@@ -18,6 +19,9 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
     "Accept": "application/json",
 }
+
+# Mapování názvů týmů na české skloňování (volitelné - v dresu X)
+# Pro zjednodušení necháme anglické názvy
 
 
 def fmt_num(val, decimals=1):
@@ -43,15 +47,15 @@ def fmt_pct(val):
 
 def get_position_word(pos):
     if not pos:
-        return "hráč"
-    pos = str(pos).upper().strip()
-    if "GUARD" in pos or pos in ("G", "PG", "SG"):
+        return ""
+    p = str(pos).upper().strip()
+    if "GUARD" in p or p in ("G", "PG", "SG"):
         return "rozehrávač"
-    if "FORWARD" in pos or pos in ("F", "SF", "PF"):
+    if "FORWARD" in p or p in ("F", "SF", "PF"):
         return "křídlo"
-    if "CENTER" in pos or pos == "C":
+    if "CENTER" in p or p == "C":
         return "pivot"
-    return pos.lower()
+    return ""
 
 
 def safe_get(d, *keys, default=None):
@@ -82,7 +86,40 @@ def http_get(url, params=None):
     return None
 
 
+def extract_numeric_id(player_item):
+    """Z search výsledku vytáhne numerické ESPN ID z link.web URL.
+    Příklad: https://www.espn.com/nba/player/_/id/3112335/nikola-jokic → 3112335"""
+    # Hledáme nejprve v link.web
+    web_link = safe_get(player_item, "link", "web")
+    if isinstance(web_link, str):
+        m = re.search(r"/id/(\d+)/", web_link)
+        if m:
+            return m.group(1)
+    
+    # Fallback: links pole
+    links = player_item.get("links", []) or []
+    for link in links:
+        if isinstance(link, dict):
+            href = link.get("href", "")
+            m = re.search(r"/id/(\d+)/", href)
+            if m:
+                return m.group(1)
+    
+    # Posledni možnost: image URL obsahuje ID
+    image = player_item.get("image") or {}
+    if isinstance(image, dict):
+        for k in ("default", "dark", "light"):
+            url = image.get(k, "")
+            if isinstance(url, str):
+                m = re.search(r"/players/full/(\d+)\.png", url)
+                if m:
+                    return m.group(1)
+    
+    return None
+
+
 def search_player(name_query):
+    """Hledá hráče. Vrací (numeric_id, display_name, error)."""
     data = http_get(SEARCH_URL, params={
         "query": name_query, "sport": "basketball", "limit": 15
     })
@@ -95,29 +132,37 @@ def search_player(name_query):
     for category in results:
         items = category.get("contents", []) or category.get("results", []) or []
         for item in items:
+            if not isinstance(item, dict):
+                continue
+            
             item_type = (item.get("type") or "").lower()
             sport = (item.get("sport") or "").lower()
             league = (item.get("league") or "").lower()
-            default_league = (item.get("defaultLeague") or "").lower()
+            default_league_slug = (safe_get(item, "defaultLeagueSlug") or "").lower()
             
-            is_player = (item_type == "player" or "player" in item_type)
-            is_basketball = sport == "basketball" or "basketball" in sport
+            is_player = (item_type == "player")
             
-            if is_player or is_basketball:
-                pid = item.get("id") or (item.get("uid", "").split(":")[-1] if item.get("uid") else None)
-                display = (item.get("displayName") or item.get("display_name") 
-                           or item.get("name") or item.get("title", ""))
-                
-                if not pid or not display:
-                    continue
-                
-                priority = 2
-                if "nba" in league or "nba" in default_league:
-                    priority = 0
-                elif is_basketball:
-                    priority = 1
-                
-                candidates.append((priority, str(pid), display))
+            if not is_player:
+                continue
+            
+            display = (item.get("displayName") or item.get("name") 
+                       or item.get("title", ""))
+            if not display:
+                continue
+            
+            # Vytáhneme numerické ID z URL
+            num_id = extract_numeric_id(item)
+            if not num_id:
+                continue
+            
+            # Priorita: NBA > basketball > ostatní
+            priority = 2
+            if "nba" in default_league_slug or "nba" in league:
+                priority = 0
+            elif sport == "basketball":
+                priority = 1
+            
+            candidates.append((priority, num_id, display))
     
     if not candidates:
         return None, None, None
@@ -126,17 +171,111 @@ def search_player(name_query):
     return candidates[0][1], candidates[0][2], None
 
 
+# ---------- Extrakce dat z overview ----------
+
+def extract_stats_splits(overview):
+    """Vrátí dict: {'Regular Season': {labels: stats}, 'Career': {...}, 'Postseason': {...}}"""
+    statistics = overview.get("statistics") or {}
+    if not isinstance(statistics, dict):
+        return {}
+    
+    labels = statistics.get("labels", []) or []
+    names = statistics.get("names", []) or []
+    splits = statistics.get("splits", []) or []
+    
+    # Použijeme 'names' (technické klíče) protože jsou stabilnější
+    keys = names if names else labels
+    
+    result = {}
+    for split in splits:
+        if not isinstance(split, dict):
+            continue
+        display = split.get("displayName", "")
+        stats = split.get("stats", []) or []
+        if not display or not stats:
+            continue
+        stat_dict = {}
+        for i, key in enumerate(keys):
+            if i < len(stats):
+                stat_dict[key] = stats[i]
+        result[display] = stat_dict
+    
+    return result
+
+
+def extract_team_from_overview(overview, player_id):
+    """Z nextGame vytáhne tým hráče.
+    nextGame má 'shortName' jako 'DEN @ MIN' nebo 'DEN vs MIN' 
+    a 'links' s URL na týmy. Náš hráč hraje za jeden z nich."""
+    
+    next_game = overview.get("nextGame") or {}
+    if not isinstance(next_game, dict):
+        return None
+    
+    # nextGame.name může být něco jako "Denver Nuggets at Minnesota Timberwolves"
+    name = next_game.get("name", "")
+    short_name = next_game.get("shortName", "")
+    
+    # Hledáme v events pole zápasů
+    events = next_game.get("events", []) or []
+    if events and isinstance(events, list):
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            # competitions
+            comps = ev.get("competitions", []) or []
+            for comp in comps:
+                if not isinstance(comp, dict):
+                    continue
+                competitors = comp.get("competitors", []) or []
+                for c in competitors:
+                    if not isinstance(c, dict):
+                        continue
+                    # athletes
+                    athletes = c.get("athletes", []) or []
+                    for a in athletes:
+                        if isinstance(a, dict) and str(a.get("id", "")) == str(player_id):
+                            team = c.get("team") or {}
+                            return team.get("displayName") or team.get("name")
+    
+    # Fallback: z links nextGame - tým je obvykle v home_team nebo first link
+    # nextGame.links často obsahuje "/nba/team/_/name/{abbr}/{slug}" URLs
+    links = next_game.get("links", []) or []
+    home_team_id = next_game.get("homeTeamId")
+    away_team_id = next_game.get("awayTeamId")
+    
+    # Pokud nextGame.name má formát "Team A at Team B" → home je B
+    # A pokud athleteId hraje za home (homeTeamId)... ale to nevíme bez dalšího lookupu
+    
+    # Tip: použijeme jméno z `name` pole rozdělené na " at "
+    if name and " at " in name:
+        # name: "Denver Nuggets at Minnesota Timberwolves" - nemůžu poznat kde hraje hráč
+        # Ale můžeme to říct v generickém tvaru
+        teams = name.split(" at ")
+        if len(teams) == 2:
+            # Vrátíme oba - upravíme to v generate_player_text
+            return None  # raději nic než špatně
+    
+    return None
+
+
+def extract_team_from_search(player_id):
+    """Alternativní cesta - znovu zavoláme search a vytáhneme tým ze subtitle."""
+    # Tohle by bylo neefektivní - vynecháme
+    return None
+
+
 def extract_awards_summary(overview):
-    awards = safe_get(overview, "awards", default=[])
-    if not awards or not isinstance(awards, list):
+    awards = overview.get("awards") or []
+    if not isinstance(awards, list):
         return []
     
     summary = []
     for award in awards:
         if not isinstance(award, dict):
             continue
-        count = award.get("displayCount") or ""
-        name = award.get("name", "")
+        count = award.get("displayCount") or "1x"
+        name = award.get("name", "") or ""
         seasons = award.get("seasons", []) or []
         if not name:
             continue
@@ -150,6 +289,8 @@ def extract_awards_summary(overview):
             summary.append(("all_nba", name, count, seasons))
         elif "all-defensive" in nl:
             summary.append(("all_defense", name, count, seasons))
+        elif "all-star mvp" in nl:
+            summary.append(("asg_mvp", name, count, seasons))
         elif "all-star" in nl:
             summary.append(("all_star", name, count, seasons))
         elif "rookie of the year" in nl:
@@ -164,104 +305,24 @@ def extract_awards_summary(overview):
             summary.append(("leader_ast", name, count, seasons))
         elif "rebounds" in nl:
             summary.append(("leader_reb", name, count, seasons))
+        elif "cup mvp" in nl:
+            summary.append(("cup_mvp", name, count, seasons))
     
     return summary
 
 
-def extract_team_name(overview):
-    for path in [("team",), ("gameLog", "team"), ("athlete", "team"), ("statistics", "team")]:
-        t = safe_get(overview, *path)
-        if isinstance(t, dict):
-            name = t.get("displayName") or t.get("name")
-            if name:
-                return name
-        elif isinstance(t, str) and t:
-            return t
-    
-    # Pokus přes opponent z posledního zápasu
-    events = safe_get(overview, "gameLog", "events")
-    last_ev = None
-    if isinstance(events, dict):
-        keys = sorted(events.keys(), reverse=True)
-        if keys:
-            last_ev = events[keys[0]]
-    elif isinstance(events, list) and events:
-        last_ev = events[0]
-    
-    if last_ev and isinstance(last_ev, dict):
-        # Tým hráče může být v "team" objektu
-        for k in ["team", "athleteTeam", "homeTeam", "awayTeam"]:
-            t = last_ev.get(k)
-            if isinstance(t, dict):
-                name = t.get("displayName") or t.get("name") or t.get("location")
-                if name:
-                    return name
-    
-    return None
+def parse_count(c):
+    """Parse '5x' nebo '5X' nebo '5' na int."""
+    if c is None:
+        return 1
+    s = str(c).strip().lower().replace("x", "").strip()
+    try:
+        return int(s) if s else 1
+    except (ValueError, TypeError):
+        return 1
 
 
-def calc_averages_from_gamelog(overview):
-    labels = safe_get(overview, "gameLog", "labels") \
-             or safe_get(overview, "gameLog", "names") \
-             or []
-    
-    season_types = safe_get(overview, "gameLog", "seasonTypes")
-    if season_types and isinstance(season_types, list):
-        for st in season_types:
-            if not isinstance(st, dict):
-                continue
-            categories = st.get("categories", []) or []
-            for cat in categories:
-                if not isinstance(cat, dict):
-                    continue
-                totals = cat.get("totals") or cat.get("statistics")
-                events = cat.get("events", []) or []
-                if totals and labels and isinstance(totals, list):
-                    stat_dict = {}
-                    for i, label in enumerate(labels):
-                        if i < len(totals):
-                            stat_dict[label] = totals[i]
-                    stat_dict["GP"] = len(events) if events else None
-                    return stat_dict
-    
-    # Fallback - spočítat z events
-    events = safe_get(overview, "gameLog", "events")
-    events_list = []
-    if isinstance(events, dict):
-        events_list = list(events.values())
-    elif isinstance(events, list):
-        events_list = events
-    
-    if not events_list or not labels:
-        return None
-    
-    sum_stats = {}
-    count = 0
-    for ev in events_list:
-        if not isinstance(ev, dict):
-            continue
-        stats = ev.get("stats", []) or []
-        if not stats:
-            continue
-        count += 1
-        for i, label in enumerate(labels):
-            if i < len(stats):
-                val = stats[i]
-                try:
-                    if val in (None, "", "-"):
-                        continue
-                    num = float(val)
-                    sum_stats[label] = sum_stats.get(label, 0) + num
-                except (ValueError, TypeError):
-                    pass
-    
-    if count == 0:
-        return None
-    
-    avg = {k: v / count for k, v in sum_stats.items()}
-    avg["GP"] = count
-    return avg
-
+# ---------- Generátor textu ----------
 
 def generate_player_text(player_id, display_name):
     overview = http_get(OVERVIEW_URL.format(id=player_id))
@@ -274,26 +335,27 @@ def generate_player_text(player_id, display_name):
             "career_paragraph": "Data nedostupná.",
         }
     
-    team = extract_team_name(overview) or ""
-    position = overview.get("position", "") or ""
-    if isinstance(position, dict):
-        position = position.get("abbreviation") or position.get("displayName", "")
+    # Tým - zkusíme různé cesty
+    team = extract_team_from_overview(overview, player_id) or ""
+    
+    # Pozice - není v overview přímo, necháme prázdné nebo z awards/positions
+    position = ""
+    
+    # Stats splits
+    splits = extract_stats_splits(overview)
+    regular_season = splits.get("Regular Season")
+    career_stats = splits.get("Career")
     
     awards = extract_awards_summary(overview)
-    season_stats = calc_averages_from_gamelog(overview)
     
-    season_year = safe_get(overview, "gameLog", "season", "year") \
-                  or safe_get(overview, "season", "year") \
-                  or ""
-    
-    has_gamelog = bool(safe_get(overview, "gameLog", "events"))
-    is_active = has_gamelog
+    # Aktivní = má Regular Season záznam s nějakými statistikami
+    is_active = bool(regular_season and regular_season.get("gamesPlayed"))
     
     season_paragraph = build_season_paragraph(
-        display_name, season_stats, team, position, is_active, season_year
+        display_name, regular_season, team, position, is_active
     )
     career_paragraph = build_career_paragraph(
-        display_name, awards, team, position, is_active
+        display_name, career_stats, awards, team, position, is_active
     )
     
     return {
@@ -304,55 +366,38 @@ def generate_player_text(player_id, display_name):
     }
 
 
-def build_season_paragraph(name, stats, team, position, is_active, season_year):
+def build_season_paragraph(name, stats, team, position, is_active):
     pos_word = get_position_word(position)
     team_phrase = f"v dresu {team}" if team else ""
-    
-    season_label = ""
-    if season_year:
-        try:
-            yr = int(season_year)
-            season_label = f"{yr-1}/{str(yr)[-2:]}"
-        except (ValueError, TypeError):
-            season_label = str(season_year)
     
     if not stats:
         if is_active:
             return (
                 f"{name} aktuálně působí v NBA"
                 + (f" {team_phrase}" if team_phrase else "")
-                + ". Detailní sezónní statistiky nejsou momentálně v očekávaném "
-                "formátu k dispozici, ale podle ESPN gamelog je hráč aktivní v probíhající sezóně."
+                + ". Sezónní statistiky nejsou momentálně k dispozici v očekávaném formátu."
             )
         else:
             return (
                 f"{name} momentálně nepatří k aktivním hráčům NBA. "
-                f"Aktuální sezónní statistiky nejsou k dispozici."
+                f"Aktuální sezónní statistiky proto nejsou k dispozici."
             )
     
-    def gs(*keys):
-        for k in keys:
-            for variant in [k, k.upper(), k.lower(), k.title()]:
-                if variant in stats and stats[variant] not in (None, "", "-"):
-                    return stats[variant]
-        return None
+    # ESPN klíče
+    gp = stats.get("gamesPlayed")
+    mpg = stats.get("avgMinutes")
+    ppg = stats.get("avgPoints")
+    rpg = stats.get("avgRebounds")
+    apg = stats.get("avgAssists")
+    spg = stats.get("avgSteals")
+    bpg = stats.get("avgBlocks")
+    fg_pct = stats.get("fieldGoalPct")
+    fg3_pct = stats.get("threePointPct")
+    ft_pct = stats.get("freeThrowPct")
+    topg = stats.get("avgTurnovers")
     
-    gp = gs("GP", "G", "Games")
-    pts = gs("PTS", "Points")
-    reb = gs("REB", "TR", "Rebounds")
-    ast = gs("AST", "Assists")
-    stl = gs("STL", "Steals")
-    blk = gs("BLK", "Blocks")
-    fg_pct = gs("FG%", "FGP")
-    fg3_pct = gs("3P%", "3PT%", "3PTPCT")
-    ft_pct = gs("FT%", "FTP")
-    minutes = gs("MIN", "Minutes", "MPG")
-    
-    intro_parts = [name]
-    if season_label:
-        intro_parts.append(f"v sezóně {season_label}")
-    elif is_active:
-        intro_parts.append("v aktuální sezóně")
+    # Sezónní intro
+    intro_parts = [name, "v aktuální sezóně"]
     if team_phrase:
         intro_parts.append(team_phrase)
     
@@ -360,26 +405,28 @@ def build_season_paragraph(name, stats, team, position, is_active, season_year):
     
     if gp:
         intro += f" odehrál {fmt_num(gp, 0)} zápasů"
-        if minutes:
-            intro += f" s průměrem {fmt_num(minutes)} minuty na utkání"
+        if mpg:
+            intro += f" s průměrem {fmt_num(mpg)} minuty na utkání"
     intro += "."
     
+    # Per game stats
     pgs = []
-    if pts is not None: pgs.append(f"{fmt_num(pts)} bodu")
-    if reb is not None: pgs.append(f"{fmt_num(reb)} doskoku")
-    if ast is not None: pgs.append(f"{fmt_num(ast)} asistence")
+    if ppg is not None: pgs.append(f"{fmt_num(ppg)} bodu")
+    if rpg is not None: pgs.append(f"{fmt_num(rpg)} doskoku")
+    if apg is not None: pgs.append(f"{fmt_num(apg)} asistence")
     
     sentence2 = ""
     if pgs:
-        prefix = f" Jako {pos_word}" if pos_word != "hráč" else ""
+        prefix = f" Jako {pos_word}" if pos_word else ""
         sentence2 = f"{prefix} zaznamenává {', '.join(pgs)} na zápas"
         extras = []
-        if stl is not None: extras.append(f"{fmt_num(stl)} zisku")
-        if blk is not None: extras.append(f"{fmt_num(blk)} bloku")
+        if spg is not None: extras.append(f"{fmt_num(spg)} zisku")
+        if bpg is not None: extras.append(f"{fmt_num(bpg)} bloku")
         if extras:
             sentence2 += f" a k tomu přidává {' a '.join(extras)}"
         sentence2 += "."
     
+    # Procenta
     pcts = []
     if fg_pct is not None: pcts.append(f"ze hry {fmt_pct(fg_pct)}")
     if fg3_pct is not None: pcts.append(f"za tři {fmt_pct(fg3_pct)}")
@@ -390,56 +437,39 @@ def build_season_paragraph(name, stats, team, position, is_active, season_year):
         joined = ", ".join(pcts)
         sentence3 = f" Střelecky vykazuje {joined}."
     
-    return intro + sentence2 + sentence3
+    # Turnover - pokud máme
+    sentence4 = ""
+    if topg is not None:
+        sentence4 = f" Na zápas ztrácí míč {fmt_num(topg)}krát."
+    
+    return intro + sentence2 + sentence3 + sentence4
 
 
-def build_career_paragraph(name, awards, team, position, is_active):
+def build_career_paragraph(name, career_stats, awards, team, position, is_active):
     pos_word = get_position_word(position)
     
-    def parse_count(c):
-        """Parse '5x' nebo '3X' nebo '1' na int."""
-        if c is None:
-            return 1
-        s = str(c).strip().lower().replace("x", "").strip()
-        try:
-            return int(s) if s else 1
-        except (ValueError, TypeError):
-            return 1
-    
-    if not awards:
-        intro = f"{name}"
-        if pos_word != "hráč":
-            intro += f", {pos_word}"
-        if team:
-            intro += f" v dresu {team}"
-        intro += ", patří mezi hráče NBA."
-        intro += (
-            " Detailní kariérní statistiky a historické highs jsou dostupné "
-            "na specializovaných databázích jako Basketball-Reference nebo "
-            "oficiálních stránkách NBA."
-        )
-        return intro
-    
+    # Awards souhrn
     by_type = {}
     for typ, n, c, s in awards:
         by_type.setdefault(typ, []).append((n, c, s))
     
-    parts = []
+    awards_parts = []
     
-    def cnt_phrase(count, singular, plural):
+    def cnt_phrase(count, label):
         n = parse_count(count)
         if n > 1:
-            return f"{n}× {plural}"
-        return singular
+            return f"{n}× {label}"
+        return label
     
     if "mvp" in by_type:
         n, c, s = by_type["mvp"][0]
-        parts.append(cnt_phrase(c, "MVP základní části", "MVP základní části"))
+        awards_parts.append(cnt_phrase(c, "MVP základní části"))
     
     if "finals_mvp" in by_type:
         n, c, s = by_type["finals_mvp"][0]
         seasons_str = ""
-        if s and isinstance(s, list) and parse_count(c) <= 1:
+        cnt = parse_count(c)
+        if s and isinstance(s, list) and cnt <= 1:
             try:
                 yrs = []
                 for x in s[:3]:
@@ -453,72 +483,109 @@ def build_career_paragraph(name, awards, team, position, is_active):
                     seasons_str = f" ({', '.join(yrs)})"
             except (ValueError, TypeError):
                 pass
-        parts.append(cnt_phrase(c, f"MVP finále NBA{seasons_str}", "MVP finále NBA"))
+        if cnt > 1:
+            awards_parts.append(f"{cnt}× MVP finále NBA")
+        else:
+            awards_parts.append(f"MVP finále NBA{seasons_str}")
     
     if "all_nba" in by_type:
         total = sum(parse_count(c) for _, c, _ in by_type["all_nba"])
         if total > 0:
-            parts.append(f"{total}× nominace do All-NBA Teams")
+            awards_parts.append(f"{total}× nominace do All-NBA Teams")
     
     if "dpoy" in by_type:
         n, c, s = by_type["dpoy"][0]
-        parts.append(cnt_phrase(c, "Defensive Player of the Year", "Defensive Player of the Year"))
+        awards_parts.append(cnt_phrase(c, "Defensive Player of the Year"))
     
     if "all_defense" in by_type:
         total = sum(parse_count(c) for _, c, _ in by_type["all_defense"])
         if total > 0:
-            parts.append(f"{total}× All-Defensive Team")
+            awards_parts.append(f"{total}× All-Defensive Team")
     
     if "all_star" in by_type:
         n, c, s = by_type["all_star"][0]
-        parts.append(cnt_phrase(c, "účastník All-Star Game", "účastník All-Star Game"))
+        awards_parts.append(cnt_phrase(c, "účastník All-Star Game"))
+    
+    if "asg_mvp" in by_type:
+        n, c, s = by_type["asg_mvp"][0]
+        awards_parts.append(cnt_phrase(c, "MVP All-Star Game"))
     
     if "roy" in by_type:
-        parts.append("Rookie of the Year")
+        awards_parts.append("Rookie of the Year")
     
     if "sixth" in by_type:
         n, c, s = by_type["sixth"][0]
-        parts.append(cnt_phrase(c, "Sixth Man of the Year", "Sixth Man of the Year"))
+        awards_parts.append(cnt_phrase(c, "Sixth Man of the Year"))
     
-    leader_parts = []
+    if "cup_mvp" in by_type:
+        n, c, s = by_type["cup_mvp"][0]
+        awards_parts.append(cnt_phrase(c, "MVP NBA Cupu"))
+    
     if "leader_scoring" in by_type:
         n, c, s = by_type["leader_scoring"][0]
-        leader_parts.append(cnt_phrase(c, "král střelců", "král střelců"))
+        awards_parts.append(cnt_phrase(c, "král střelců"))
     if "leader_ast" in by_type:
         n, c, s = by_type["leader_ast"][0]
-        leader_parts.append(cnt_phrase(c, "lídr v asistencích", "lídr v asistencích"))
+        awards_parts.append(cnt_phrase(c, "lídr v asistencích"))
     if "leader_reb" in by_type:
         n, c, s = by_type["leader_reb"][0]
-        leader_parts.append(cnt_phrase(c, "lídr v doskocích", "lídr v doskocích"))
-    parts.extend(leader_parts)
+        awards_parts.append(cnt_phrase(c, "lídr v doskocích"))
     
-    if not parts:
-        intro = f"{name} patří mezi hráče NBA s několika kariérními úspěchy."
-    else:
-        intro = f"{name}"
-        if pos_word != "hráč":
-            intro += f", {pos_word}"
-        if team:
-            intro += f" v dresu {team}"
-        intro += ", patří mezi nejvýraznější jména NBA — je "
-        
-        if len(parts) == 1:
-            intro += parts[0] + "."
-        elif len(parts) == 2:
-            intro += parts[0] + " a " + parts[1] + "."
+    # Sestavení odstavce
+    # 1. věta - úspěchy
+    sentence1 = name
+    if pos_word:
+        sentence1 += f", {pos_word}"
+    if team:
+        sentence1 += f" v dresu {team}"
+    
+    if awards_parts:
+        sentence1 += ", patří mezi nejvýraznější jména NBA — je "
+        if len(awards_parts) == 1:
+            sentence1 += awards_parts[0] + "."
+        elif len(awards_parts) == 2:
+            sentence1 += awards_parts[0] + " a " + awards_parts[1] + "."
         else:
-            intro += ", ".join(parts[:-1]) + " a " + parts[-1] + "."
+            sentence1 += ", ".join(awards_parts[:-1]) + " a " + awards_parts[-1] + "."
+    else:
+        sentence1 += "."
     
+    # 2. věta - kariérní průměry
+    sentence2 = ""
+    if career_stats:
+        gp = career_stats.get("gamesPlayed")
+        ppg = career_stats.get("avgPoints")
+        rpg = career_stats.get("avgRebounds")
+        apg = career_stats.get("avgAssists")
+        fg_pct = career_stats.get("fieldGoalPct")
+        fg3_pct = career_stats.get("threePointPct")
+        ft_pct = career_stats.get("freeThrowPct")
+        
+        if gp and (ppg or rpg or apg):
+            pgs = []
+            if ppg is not None: pgs.append(f"{fmt_num(ppg)} bodu")
+            if rpg is not None: pgs.append(f"{fmt_num(rpg)} doskoku")
+            if apg is not None: pgs.append(f"{fmt_num(apg)} asistence")
+            
+            sentence2 = f" V základní části kariéry odehrál {fmt_num(gp, 0)} zápasů s průměry {', '.join(pgs)} na utkání"
+            
+            pcts = []
+            if fg_pct is not None: pcts.append(f"ze hry {fmt_pct(fg_pct)}")
+            if fg3_pct is not None: pcts.append(f"za tři {fmt_pct(fg3_pct)}")
+            if ft_pct is not None: pcts.append(f"z trestného hodu {fmt_pct(ft_pct)}")
+            if pcts:
+                sentence2 += f", dlouhodobě střílí {', '.join(pcts)}"
+            sentence2 += "."
+    
+    # 3. status
+    sentence3 = ""
     if not is_active:
-        intro += " V současnosti není veden jako aktivní hráč NBA."
+        sentence3 = " V současnosti není veden jako aktivní hráč NBA."
     
-    intro += (
-        " Pro úplné kariérní průměry a sezónní rozpis lze nahlédnout "
-        "na Basketball-Reference nebo na oficiální stránky NBA."
-    )
-    
-    return intro
+    return sentence1 + sentence2 + sentence3
 
+
+# ---------- Routes ----------
 
 @app.route("/")
 def index():
@@ -547,63 +614,21 @@ def api_player():
         return jsonify({"error": f"Chyba při zpracování: {str(e)}"}), 500
 
 
-@app.route("/api/debug-search")
-def api_debug_search():
-    """Vidíme, co search vrací pro dané jméno."""
-    name = request.args.get("name", "").strip()
-    if not name:
-        return jsonify({"error": "Zadej ?name=..."}), 400
-    
-    raw = http_get(SEARCH_URL, params={
-        "query": name, "sport": "basketball", "limit": 15
-    })
-    pid, display, err = search_player(name)
-    return jsonify({
-        "chosen_player_id": pid,
-        "chosen_display": display,
-        "error": err,
-        "raw_results_categories": [
-            {
-                "type": cat.get("type"),
-                "displayName": cat.get("displayName"),
-                "item_count": len(cat.get("contents", []) or cat.get("results", []) or []),
-                "first_item": (cat.get("contents") or cat.get("results") or [{}])[0] if (cat.get("contents") or cat.get("results")) else None,
-            }
-            for cat in (raw.get("results", []) if raw else [])
-        ],
-    })
-
-
 @app.route("/api/debug/<player_id>")
 def api_debug(player_id):
     overview = http_get(OVERVIEW_URL.format(id=player_id))
     if not overview:
         return jsonify({"error": "overview unavailable"}), 500
     
-    statistics = overview.get("statistics") or {}
-    next_game = overview.get("nextGame") or {}
-    game_log = overview.get("gameLog") or {}
+    splits = extract_stats_splits(overview)
+    awards = extract_awards_summary(overview)
     
     return jsonify({
-        "overview_top_keys": list(overview.keys()),
-        # Statistics struktura
-        "statistics_keys": list(statistics.keys()) if isinstance(statistics, dict) else f"type:{type(statistics).__name__}",
-        "statistics_sample": statistics if not isinstance(statistics, (dict, list)) or (isinstance(statistics, (list, dict)) and len(str(statistics)) < 3000) else str(statistics)[:3000],
-        # nextGame struktura  
-        "nextGame_keys": list(next_game.keys()) if isinstance(next_game, dict) else f"type:{type(next_game).__name__}",
-        "nextGame_sample": next_game if isinstance(next_game, (dict, list)) and len(str(next_game)) < 1500 else str(next_game)[:1500],
-        # gameLog
-        "gameLog_keys": list(game_log.keys()) if isinstance(game_log, dict) else f"type:{type(game_log).__name__}",
-        "gameLog_statistics_keys": list(game_log.get("statistics", {}).keys()) if isinstance(game_log.get("statistics"), dict) else None,
-        "gameLog_events_type": type(game_log.get("events")).__name__,
-        "gameLog_events_sample": (list(game_log["events"].values())[0] if isinstance(game_log.get("events"), dict) and game_log["events"] else (game_log["events"][0] if isinstance(game_log.get("events"), list) and game_log["events"] else None)),
-        # Awards
-        "awards_count": len(overview.get("awards", []) or []),
-        "first_award": (overview.get("awards") or [{}])[0] if overview.get("awards") else None,
-        # Current extraction
-        "extracted_team": extract_team_name(overview),
-        "extracted_awards_count": len(extract_awards_summary(overview)),
-        "extracted_stats": calc_averages_from_gamelog(overview),
+        "extracted_team": extract_team_from_overview(overview, player_id),
+        "splits_keys": list(splits.keys()),
+        "regular_season": splits.get("Regular Season"),
+        "career": splits.get("Career"),
+        "awards_summary": awards[:10],
     })
 
 
