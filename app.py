@@ -67,11 +67,20 @@ def get_position_word(pos):
 # ---------- API volání ----------
 
 def find_player(name_query):
-    """Najde hráče podle jména přes balldontlie API."""
+    """Najde hráče podle jména přes balldontlie API.
+    balldontlie API hledá jen jedno slovo, takže rozdělíme jméno
+    a hledáme nejprve podle posledního slova (příjmení), pak filtrujeme."""
     try:
+        # Pokud má jméno víc slov, hledáme podle posledního slova (příjmení)
+        words = name_query.strip().split()
+        if len(words) > 1:
+            search_term = words[-1]  # Příjmení
+        else:
+            search_term = words[0] if words else name_query
+        
         r = requests.get(
             f"{BASE_URL}/players",
-            params={"search": name_query, "per_page": 25},
+            params={"search": search_term, "per_page": 50},
             headers=HEADERS,
             timeout=TIMEOUT,
         )
@@ -80,12 +89,22 @@ def find_player(name_query):
         data = r.json().get("data", [])
         if not data:
             return None, None  # nenalezeno, ale ne chyba
-        # Vrátíme nejlepší match - exact match má prioritu
-        name_lower = name_query.lower()
-        for p in data:
-            full = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip().lower()
-            if full == name_lower:
-                return p, None
+        
+        # Pokud uživatel zadal celé jméno, hledáme přesný match
+        name_lower = name_query.lower().strip()
+        if len(words) > 1:
+            for p in data:
+                full = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip().lower()
+                if full == name_lower:
+                    return p, None
+            # Pokud přesný match nenajdeme, vrátíme prvního který má v jménu daný token
+            first_word_lower = words[0].lower()
+            for p in data:
+                first = p.get('first_name', '').lower()
+                if first.startswith(first_word_lower):
+                    return p, None
+        
+        # Default: první výsledek
         return data[0], None
     except requests.exceptions.RequestException as e:
         return None, f"Síťová chyba: {str(e)}"
