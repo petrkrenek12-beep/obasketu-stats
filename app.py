@@ -547,18 +547,60 @@ def api_player():
         return jsonify({"error": f"Chyba při zpracování: {str(e)}"}), 500
 
 
+@app.route("/api/debug-search")
+def api_debug_search():
+    """Vidíme, co search vrací pro dané jméno."""
+    name = request.args.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Zadej ?name=..."}), 400
+    
+    raw = http_get(SEARCH_URL, params={
+        "query": name, "sport": "basketball", "limit": 15
+    })
+    pid, display, err = search_player(name)
+    return jsonify({
+        "chosen_player_id": pid,
+        "chosen_display": display,
+        "error": err,
+        "raw_results_categories": [
+            {
+                "type": cat.get("type"),
+                "displayName": cat.get("displayName"),
+                "item_count": len(cat.get("contents", []) or cat.get("results", []) or []),
+                "first_item": (cat.get("contents") or cat.get("results") or [{}])[0] if (cat.get("contents") or cat.get("results")) else None,
+            }
+            for cat in (raw.get("results", []) if raw else [])
+        ],
+    })
+
+
 @app.route("/api/debug/<player_id>")
 def api_debug(player_id):
     overview = http_get(OVERVIEW_URL.format(id=player_id))
     if not overview:
         return jsonify({"error": "overview unavailable"}), 500
     
+    statistics = overview.get("statistics") or {}
+    next_game = overview.get("nextGame") or {}
+    game_log = overview.get("gameLog") or {}
+    
     return jsonify({
         "overview_top_keys": list(overview.keys()),
-        "gameLog_keys": list(safe_get(overview, "gameLog", default={}).keys()) if isinstance(overview.get("gameLog"), dict) else None,
-        "gameLog_labels": safe_get(overview, "gameLog", "labels") or safe_get(overview, "gameLog", "names"),
+        # Statistics struktura
+        "statistics_keys": list(statistics.keys()) if isinstance(statistics, dict) else f"type:{type(statistics).__name__}",
+        "statistics_sample": statistics if not isinstance(statistics, (dict, list)) or (isinstance(statistics, (list, dict)) and len(str(statistics)) < 3000) else str(statistics)[:3000],
+        # nextGame struktura  
+        "nextGame_keys": list(next_game.keys()) if isinstance(next_game, dict) else f"type:{type(next_game).__name__}",
+        "nextGame_sample": next_game if isinstance(next_game, (dict, list)) and len(str(next_game)) < 1500 else str(next_game)[:1500],
+        # gameLog
+        "gameLog_keys": list(game_log.keys()) if isinstance(game_log, dict) else f"type:{type(game_log).__name__}",
+        "gameLog_statistics_keys": list(game_log.get("statistics", {}).keys()) if isinstance(game_log.get("statistics"), dict) else None,
+        "gameLog_events_type": type(game_log.get("events")).__name__,
+        "gameLog_events_sample": (list(game_log["events"].values())[0] if isinstance(game_log.get("events"), dict) and game_log["events"] else (game_log["events"][0] if isinstance(game_log.get("events"), list) and game_log["events"] else None)),
+        # Awards
         "awards_count": len(overview.get("awards", []) or []),
         "first_award": (overview.get("awards") or [{}])[0] if overview.get("awards") else None,
+        # Current extraction
         "extracted_team": extract_team_name(overview),
         "extracted_awards_count": len(extract_awards_summary(overview)),
         "extracted_stats": calc_averages_from_gamelog(overview),
