@@ -11,7 +11,7 @@ import os
 app = Flask(__name__)
 
 API_KEY = os.environ.get("BALLDONTLIE_API_KEY", "")
-BASE_URL = "https://api.balldontlie.io/v1"
+BASE_URL = "https://api.balldontlie.io/nba/v1"
 HEADERS = {"Authorization": API_KEY}
 TIMEOUT = 15
 
